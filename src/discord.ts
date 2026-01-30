@@ -97,10 +97,13 @@ const messageToSubmissionId = new Map<string, string>();
 // Event Handlers
 // ============================================================================
 
-discordClient.once(Events.ClientReady, (client) => {
+discordClient.once(Events.ClientReady, async (client) => {
   console.log(`[Discord] Bot ready: ${client.user?.tag}`);
   console.log(`[Discord] Watching guild: ${config.discordGuildId}`);
   console.log(`[Discord] Mission channel: ${config.discordMissionChannelId}`);
+
+  // Run retroactive scan for missed submissions
+  await scanMissedSubmissions();
 });
 
 /**
@@ -302,6 +305,134 @@ discordClient.on(Events.MessageReactionRemove, async (reaction, user) => {
     });
   }
 });
+
+// ============================================================================
+// Startup Scan for Missed Submissions
+// ============================================================================
+
+/**
+ * Scan mission threads for submissions that were missed while bot was offline.
+ * Checks messages from the last 24 hours that have URLs but no confirmation emoji.
+ */
+async function scanMissedSubmissions(): Promise<void> {
+  console.log('[Discord] Starting retroactive scan for missed submissions...');
+
+  try {
+    // Get the mission channel
+    const channel = await discordClient.channels.fetch(config.discordMissionChannelId);
+    if (!channel || !(channel instanceof TextChannel)) {
+      console.error('[Discord] Mission channel not found or not a text channel');
+      return;
+    }
+
+    // Get all active (non-archived) threads in the channel
+    const activeThreads = await channel.threads.fetchActive();
+    const archivedThreads = await channel.threads.fetchArchived({ limit: 20 });
+
+    const allThreads = [
+      ...activeThreads.threads.values(),
+      ...archivedThreads.threads.values(),
+    ];
+
+    console.log(`[Discord] Found ${allThreads.length} threads to scan`);
+
+    let missedCount = 0;
+    const cutoffTime = Date.now() - 24 * 60 * 60 * 1000; // 24 hours ago
+
+    for (const thread of allThreads) {
+      // Only process threads parented to the mission channel
+      if (thread.parentId !== config.discordMissionChannelId) continue;
+
+      try {
+        // Fetch recent messages (up to 100)
+        const messages = await thread.messages.fetch({ limit: 100 });
+
+        for (const [, message] of messages) {
+          // Skip bot messages
+          if (message.author.bot) continue;
+
+          // Skip messages older than 24 hours
+          if (message.createdTimestamp < cutoffTime) continue;
+
+          // Check if message contains a URL
+          const urlRegex = /(https?:\/\/[^\s]+)/g;
+          const urls = message.content.match(urlRegex);
+          if (!urls || urls.length === 0) continue;
+
+          // Check if already tracked in storage
+          const existingSubmission = getSubmissionByMessage(message.id);
+          if (existingSubmission) continue;
+
+          // Check if message already has confirmation emoji (was processed before)
+          const hasConfirmation = message.reactions.cache.has(CONFIRMATION_EMOJI);
+          if (hasConfirmation) continue;
+
+          // This is a missed submission - process it
+          console.log(`[Discord] Found missed submission in "${thread.name}" from ${message.author.tag}`);
+
+          // Ensure mission is registered
+          let mission = getMissionByThread(thread.id);
+          if (!mission) {
+            let deadline: Date | null = null;
+            const starterMessage = await fetchThreadStarterMessage(thread);
+
+            if (starterMessage) {
+              deadline = parseDiscordTimestamp(starterMessage.content);
+            }
+
+            if (!deadline) {
+              deadline = new Date();
+              deadline.setDate(deadline.getDate() + 7);
+            }
+
+            mission = registerMission(thread.id, thread.name, deadline);
+          }
+
+          // Create submission in storage
+          const submission = createSubmission(
+            message.id,
+            message.channel.id,
+            thread.id,
+            mission.id,
+            message.author.id,
+            message.author.tag,
+            message.content,
+            urls
+          );
+
+          // Track in memory
+          messageToSubmissionId.set(message.id, submission.id);
+
+          // Append to Google Sheets
+          appendSubmissionToSheet(mission, submission).catch(err => {
+            console.error('[Discord] Failed to append missed submission to sheets:', err);
+          });
+
+          // Add reactions
+          try {
+            await message.react(CONFIRMATION_EMOJI);
+            for (const emoji of VOTE_EMOJI_ORDER) {
+              await message.react(emoji);
+            }
+          } catch (err) {
+            console.error('[Discord] Failed to add reactions to missed submission:', err);
+          }
+
+          missedCount++;
+
+          // Small delay to avoid rate limits
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      } catch (err) {
+        console.error(`[Discord] Error scanning thread ${thread.id}:`, err);
+      }
+    }
+
+    console.log(`[Discord] Retroactive scan complete. Found ${missedCount} missed submissions.`);
+  } catch (error) {
+    console.error('[Discord] Error during retroactive scan:', error);
+  }
+}
 
 // ============================================================================
 // Bot Lifecycle
