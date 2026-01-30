@@ -159,6 +159,34 @@ export function getMissionsPastDeadline(): StoredMission[] {
 }
 
 /**
+ * Update a mission's deadline
+ */
+export function updateMissionDeadline(missionId: string, newDeadline: Date): boolean {
+  const data = loadMissions();
+  const mission = data.missions.find(m => m.id === missionId);
+  if (mission && mission.status === 'active') {
+    mission.deadline = newDeadline.toISOString();
+    saveMissions(data);
+    console.log(`[Storage] Mission deadline updated: ${missionId} -> ${newDeadline.toISOString()}`);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Mark mission as closed (thread locked, awaiting export)
+ */
+export function markMissionClosed(missionId: string): void {
+  const data = loadMissions();
+  const mission = data.missions.find(m => m.id === missionId);
+  if (mission) {
+    mission.status = 'closed';
+    saveMissions(data);
+    console.log(`[Storage] Mission marked closed: ${missionId}`);
+  }
+}
+
+/**
  * Mark mission as exported
  */
 export function markMissionExported(missionId: string): void {

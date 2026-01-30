@@ -13,6 +13,8 @@ import {
   GatewayIntentBits,
   Events,
   ThreadChannel,
+  Message,
+  TextChannel,
 } from 'discord.js';
 import { config } from './config';
 import {
@@ -47,6 +49,43 @@ const VOTE_EMOJIS: Record<string, number> = {
 const VOTE_EMOJI_ORDER = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
 
 const CONFIRMATION_EMOJI = '📝';
+
+// ============================================================================
+// Discord Timestamp Parsing
+// ============================================================================
+
+/**
+ * Parse Discord timestamp from message content
+ * Discord timestamps look like: <t:1706619600:R> or <t:1706619600:F> or <t:1706619600>
+ * The number is Unix epoch in seconds
+ * Returns the first timestamp found, or null if none
+ */
+function parseDiscordTimestamp(content: string): Date | null {
+  // Match Discord timestamp format: <t:TIMESTAMP> or <t:TIMESTAMP:STYLE>
+  const timestampRegex = /<t:(\d+)(?::[tTdDfFR])?>/g;
+  const match = timestampRegex.exec(content);
+
+  if (match && match[1]) {
+    const unixSeconds = parseInt(match[1], 10);
+    return new Date(unixSeconds * 1000);
+  }
+
+  return null;
+}
+
+/**
+ * Fetch the parent (starter) message of a thread
+ */
+async function fetchThreadStarterMessage(thread: ThreadChannel): Promise<Message | null> {
+  try {
+    // The thread ID is the same as the starter message ID for message-based threads
+    const starterMessage = await thread.fetchStarterMessage();
+    return starterMessage;
+  } catch (error) {
+    console.log(`[Discord] Could not fetch starter message for thread ${thread.id}:`, error);
+    return null;
+  }
+}
 
 // In-memory index for quick message -> submission lookups
 // This is rebuilt on each message, file storage is source of truth
@@ -89,10 +128,25 @@ discordClient.on(Events.MessageCreate, async (message) => {
     // Ensure mission is registered (create if first submission)
     let mission = getMissionByThread(thread.id);
     if (!mission) {
-      // Default deadline: 7 days from now (can be updated via command)
-      const defaultDeadline = new Date();
-      defaultDeadline.setDate(defaultDeadline.getDate() + 7);
-      mission = registerMission(thread.id, thread.name, defaultDeadline);
+      // Try to parse deadline from the thread's starter message (mission post)
+      let deadline: Date | null = null;
+      const starterMessage = await fetchThreadStarterMessage(thread);
+
+      if (starterMessage) {
+        deadline = parseDiscordTimestamp(starterMessage.content);
+        if (deadline) {
+          console.log(`[Discord] Parsed deadline from mission post: ${deadline.toISOString()}`);
+        }
+      }
+
+      // Fallback: 7 days from now if no deadline found in post
+      if (!deadline) {
+        deadline = new Date();
+        deadline.setDate(deadline.getDate() + 7);
+        console.log(`[Discord] No deadline in post, using default: ${deadline.toISOString()}`);
+      }
+
+      mission = registerMission(thread.id, thread.name, deadline);
     }
 
     // Create submission in file storage
@@ -248,4 +302,35 @@ export async function startDiscordBot(): Promise<void> {
 export async function stopDiscordBot(): Promise<void> {
   console.log('[Discord] Stopping bot...');
   await discordClient.destroy();
+}
+
+/**
+ * Close/archive a mission thread
+ * Called when deadline expires to prevent further submissions
+ */
+export async function closeThread(threadId: string, reason?: string): Promise<boolean> {
+  try {
+    const thread = await discordClient.channels.fetch(threadId);
+
+    if (!thread || !thread.isThread()) {
+      console.error(`[Discord] Thread not found or not a thread: ${threadId}`);
+      return false;
+    }
+
+    const threadChannel = thread as ThreadChannel;
+
+    // Post closing message
+    const closingMessage = reason || '🔒 **Mission deadline reached.** This thread is now closed for submissions. Results will be posted shortly.';
+    await threadChannel.send(closingMessage);
+
+    // Lock the thread (prevent new messages) and archive it
+    await threadChannel.setLocked(true, 'Mission deadline reached');
+    await threadChannel.setArchived(true, 'Mission deadline reached');
+
+    console.log(`[Discord] Thread closed and archived: ${threadId}`);
+    return true;
+  } catch (error) {
+    console.error(`[Discord] Failed to close thread ${threadId}:`, error);
+    return false;
+  }
 }

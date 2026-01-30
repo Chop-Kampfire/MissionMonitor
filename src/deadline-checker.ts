@@ -5,8 +5,9 @@
  * and triggers Google Sheets export.
  */
 
-import { getMissionsPastDeadline, StoredMission } from './storage';
+import { getMissionsPastDeadline, markMissionClosed, StoredMission } from './storage';
 import { exportMissionToSheets } from './sheets';
+import { closeThread } from './discord';
 
 // Check interval: 5 minutes
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
@@ -28,6 +29,16 @@ async function checkDeadlines(): Promise<void> {
   for (const mission of missionsPastDeadline) {
     console.log(`[DeadlineChecker] Processing: "${mission.title}" (deadline: ${mission.deadline})`);
 
+    // Step 1: Close the thread to prevent further submissions
+    const threadClosed = await closeThread(mission.threadId);
+    if (threadClosed) {
+      console.log(`[DeadlineChecker] Thread closed for "${mission.title}"`);
+      markMissionClosed(mission.id);
+    } else {
+      console.warn(`[DeadlineChecker] Could not close thread for "${mission.title}", continuing with export`);
+    }
+
+    // Step 2: Export to Google Sheets
     const result = await exportMissionToSheets(mission);
 
     if (result.success) {
