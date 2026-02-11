@@ -261,7 +261,7 @@ export async function startTelegramBot(): Promise<void> {
     const topic = ctx.match?.trim();
     if (!topic) {
       await ctx.reply(
-        '*Usage:* /mission <topic>\n\n' +
+        '*Usage:* /mission \\<topic\\>\n\n' +
         '*Example:*\n' +
         '`/mission Morgan Stanley`\n' +
         '`/mission "Pyth V3 launch"`',
@@ -422,7 +422,7 @@ export async function startTelegramBot(): Promise<void> {
     const topic = ctx.match?.trim();
     if (!topic) {
       await ctx.reply(
-        '*Usage:* /tweets <topic>\n\n' +
+        '*Usage:* /tweets \\<topic\\>\n\n' +
         '*Example:*\n' +
         '`/tweets Pyth Pro`\n' +
         '`/tweets "Morgan Stanley"`',
@@ -519,8 +519,8 @@ export async function startTelegramBot(): Promise<void> {
     await ctx.reply(
       '*Mission Control Bot*\n\n' +
       '*Commands:*\n' +
-      '/mission <topic> \\- Generate mission brief \\& create Discord thread\n' +
-      '/tweets <topic> \\- Generate tweet suggestions\n' +
+      '/mission \\<topic\\> \\- Generate mission brief \\& create Discord thread\n' +
+      '/tweets \\<topic\\> \\- Generate tweet suggestions\n' +
       '/status \\- Show current missions\n' +
       '/help \\- Show this message\n\n' +
       '*Content Submissions:*\n' +
