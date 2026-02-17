@@ -1169,12 +1169,35 @@ export async function startTelegramBot(): Promise<void> {
     console.error('[Telegram] Bot error:', err);
   });
 
-  // Start polling
-  await telegramBot.start({
-    onStart: (botInfo) => {
-      console.log(`[Telegram] Bot started: @${botInfo.username}`);
-    },
-  });
+  // Clear any stale long-polling connections before starting.
+  // This prevents 409 Conflict errors when restarting (e.g. PM2 restart)
+  // where the old getUpdates request may still be pending on Telegram's servers.
+  await telegramBot.api.deleteWebhook({ drop_pending_updates: false });
+  console.log('[Telegram] Cleared stale connections via deleteWebhook');
+
+  // Start polling with retry logic for 409 conflicts
+  const MAX_RETRIES = 5;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      await telegramBot.start({
+        onStart: (botInfo) => {
+          console.log(`[Telegram] Bot started: @${botInfo.username}`);
+        },
+      });
+      break; // bot.start() only resolves on stop, so break if it returns cleanly
+    } catch (err: any) {
+      const is409 = err?.error_code === 409 || err?.message?.includes('409');
+      if (is409 && attempt < MAX_RETRIES) {
+        const delay = attempt * 5; // 5s, 10s, 15s, 20s backoff
+        console.log(`[Telegram] 409 Conflict on attempt ${attempt}/${MAX_RETRIES}, retrying in ${delay}s...`);
+        await new Promise(resolve => setTimeout(resolve, delay * 1000));
+        // Clear stale connections again before retry
+        await telegramBot.api.deleteWebhook({ drop_pending_updates: false }).catch(() => {});
+        continue;
+      }
+      throw err; // Non-409 error or max retries exhausted
+    }
+  }
 }
 
 /**
