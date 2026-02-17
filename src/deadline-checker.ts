@@ -1,13 +1,13 @@
 /**
  * Deadline Checker for Mission Control Bot
  *
- * Runs periodically to check for missions past their deadline
- * and triggers Google Sheets export.
+ * Runs periodically to check for missions past their deadline,
+ * posts announcements, closes threads, and exports to Google Sheets.
  */
 
-import { getMissionsPastDeadline, markMissionClosed, Mission } from './storage';
+import { getMissionsPastDeadline, getSubmissionsByMission, markMissionClosed } from './storage';
 import { exportMissionToSheets, isSheetsConfigured } from './sheets';
-import { closeThread } from './discord';
+import { closeThread, postMissionSummaryToThread, postMissionResultsToChannel } from './discord';
 
 // Check interval: 5 minutes
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
@@ -15,13 +15,9 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 let checkInterval: NodeJS.Timeout | null = null;
 
 /**
- * Check for missions past deadline and export them
+ * Check for missions past deadline and process them
  */
 async function checkDeadlines(): Promise<void> {
-  if (!isSheetsConfigured()) {
-    return; // Skip if Google Sheets not configured
-  }
-
   const missionsPastDeadline = getMissionsPastDeadline();
 
   if (missionsPastDeadline.length === 0) {
@@ -33,22 +29,37 @@ async function checkDeadlines(): Promise<void> {
   for (const mission of missionsPastDeadline) {
     console.log(`[DeadlineChecker] Processing: "${mission.title}" (deadline: ${mission.deadline})`);
 
-    // Step 1: Close the thread to prevent further submissions
+    // Step 1: Fetch submissions
+    const submissions = getSubmissionsByMission(mission.id);
+    console.log(`[DeadlineChecker] "${mission.title}" has ${submissions.length} submission(s)`);
+
+    // Step 2: Post summary to thread (before locking)
+    await postMissionSummaryToThread(mission.threadId, mission, submissions);
+
+    // Step 3: Close/lock thread
     const threadClosed = await closeThread(mission.threadId);
     if (threadClosed) {
       console.log(`[DeadlineChecker] Thread closed for "${mission.title}"`);
-      markMissionClosed(mission.id);
     } else {
-      console.warn(`[DeadlineChecker] Could not close thread for "${mission.title}", continuing with export`);
+      console.warn(`[DeadlineChecker] Could not close thread for "${mission.title}"`);
     }
 
-    // Step 2: Export to Google Sheets
-    const result = await exportMissionToSheets(mission);
+    // Step 4: Always mark mission as closed
+    markMissionClosed(mission.id);
 
-    if (result.success) {
-      console.log(`[DeadlineChecker] Exported "${mission.title}" - ${result.rowCount} submissions`);
+    // Step 5: Post results to results channel
+    await postMissionResultsToChannel(mission, submissions);
+
+    // Step 6: Export to Google Sheets (only if configured)
+    if (isSheetsConfigured()) {
+      const result = await exportMissionToSheets(mission);
+      if (result.success) {
+        console.log(`[DeadlineChecker] Exported "${mission.title}" - ${result.rowCount} submissions`);
+      } else {
+        console.error(`[DeadlineChecker] Failed to export "${mission.title}": ${result.error}`);
+      }
     } else {
-      console.error(`[DeadlineChecker] Failed to export "${mission.title}": ${result.error}`);
+      console.log(`[DeadlineChecker] Sheets not configured, skipping export for "${mission.title}"`);
     }
   }
 }
@@ -57,11 +68,6 @@ async function checkDeadlines(): Promise<void> {
  * Start the deadline checker
  */
 export function startDeadlineChecker(): void {
-  if (!isSheetsConfigured()) {
-    console.log('[DeadlineChecker] Google Sheets not configured, skipping deadline checker');
-    return;
-  }
-
   console.log('[DeadlineChecker] Starting deadline checker (every 5 minutes)');
 
   // Run immediately on start

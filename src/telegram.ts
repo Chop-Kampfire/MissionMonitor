@@ -8,11 +8,15 @@
  * - /help - Show available commands
  */
 
+import * as https from 'https';
 import { Bot, Context } from 'grammy';
 import { config } from './config';
+
+// Force IPv4 — IPv6 is broken on this server and node-fetch tries it first
+const ipv4Agent = new https.Agent({ family: 4 });
 import { searchCampaigns, CampaignResult } from './services/notion';
 import { generateMissionBrief, generateTweetSuggestions, MissionBriefResult, TweetSuggestion } from './services/claude';
-import { createMissionThread } from './discord';
+import { createMissionThread, DEFAULT_MISSION_ROLE_IDS } from './discord';
 import {
   getActiveMissions,
   getMissionsPastDeadline,
@@ -20,7 +24,15 @@ import {
   updateMissionTelegramInfo,
   getMissionByThread,
   createSubmission,
+  getTemplateByName,
 } from './storage';
+import {
+  handleTemplateMissionCommand,
+  handleListTemplatesCommand,
+  handleViewTemplateCommand,
+  handleCreateTemplateCommand,
+  handleDeleteTemplateCommand,
+} from './commands/handlers';
 import { appendSubmissionToSheet, isSheetsConfigured } from './sheets';
 
 let telegramBot: Bot | null = null;
@@ -36,6 +48,13 @@ function isAllowedChat(ctx: Context): boolean {
   // Allow if no restrictions configured or if chat is in allowed list
   if (config.telegramAllowedChatIds.length === 0) return true;
   return config.telegramAllowedChatIds.includes(chatId);
+}
+
+/**
+ * Check if message is from a private (DM) chat
+ */
+function isPrivateChat(ctx: Context): boolean {
+  return ctx.chat?.type === 'private';
 }
 
 /**
@@ -245,7 +264,9 @@ export async function startTelegramBot(): Promise<void> {
   console.log('[Telegram] Starting bot...');
   console.log(`[Telegram] DEBUG: Allowed chat IDs: ${config.telegramAllowedChatIds.join(', ') || '(any)'}`);
 
-  telegramBot = new Bot(config.telegramBotToken);
+  telegramBot = new Bot(config.telegramBotToken, {
+    client: { baseFetchConfig: { agent: ipv4Agent as any } },
+  });
 
   // ============================================================================
   // /mission Command - Generate brief AND create Discord thread
@@ -253,8 +274,8 @@ export async function startTelegramBot(): Promise<void> {
   telegramBot.command('mission', async (ctx) => {
     console.log(`[Telegram] DEBUG: /mission command received from chat ${ctx.chat?.id}`);
 
-    if (!isAllowedChat(ctx)) {
-      console.log(`[Telegram] DEBUG: Chat not allowed, ignoring`);
+    if (!isPrivateChat(ctx)) {
+      console.log(`[Telegram] DEBUG: Not a private chat, ignoring command`);
       return;
     }
 
@@ -327,7 +348,7 @@ export async function startTelegramBot(): Promise<void> {
 
       console.log(`[Telegram] DEBUG: Creating Discord thread`);
       const discordBrief = formatMissionBriefForDiscord(brief);
-      const threadResult = await createMissionThread(brief.title, discordBrief);
+      const threadResult = await createMissionThread(brief.title, discordBrief, 7, { roleIds: DEFAULT_MISSION_ROLE_IDS });
 
       if (!threadResult.success) {
         console.error(`[Telegram] Failed to create Discord thread: ${threadResult.error}`);
@@ -417,7 +438,7 @@ export async function startTelegramBot(): Promise<void> {
   telegramBot.command('tweets', async (ctx) => {
     console.log(`[Telegram] DEBUG: /tweets command received from chat ${ctx.chat?.id}`);
 
-    if (!isAllowedChat(ctx)) return;
+    if (!isPrivateChat(ctx)) return;
 
     const topic = ctx.match?.trim();
     if (!topic) {
@@ -489,7 +510,7 @@ export async function startTelegramBot(): Promise<void> {
   // ============================================================================
   telegramBot.command('status', async (ctx) => {
     console.log(`[Telegram] DEBUG: /status command received`);
-    if (!isAllowedChat(ctx)) return;
+    if (!isPrivateChat(ctx)) return;
 
     const activeMissions = getActiveMissions();
     const pastDeadline = getMissionsPastDeadline();
@@ -514,22 +535,464 @@ export async function startTelegramBot(): Promise<void> {
   // ============================================================================
   telegramBot.command('help', async (ctx) => {
     console.log(`[Telegram] DEBUG: /help command received`);
-    if (!isAllowedChat(ctx)) return;
+    if (!isPrivateChat(ctx)) return;
 
     await ctx.reply(
       '*Mission Control Bot*\n\n' +
-      '*Commands:*\n' +
-      '/mission \\<topic\\> \\- Generate mission brief \\& create Discord thread\n' +
+      '*Quick Mission:*\n' +
+      '1\\. Send your mission brief as a message\n' +
+      '2\\. Reply to it with: /create title\\="Title" deadline\\=3\n\n' +
+      '*Other Commands:*\n' +
+      '/mission \\<topic\\> \\- Generate brief from Notion \\& create thread\n' +
       '/tweets \\<topic\\> \\- Generate tweet suggestions\n' +
-      '/status \\- Show current missions\n' +
-      '/help \\- Show this message\n\n' +
-      '*Content Submissions:*\n' +
-      'Reply to a mission message with your URL to submit\\.\n' +
-      'Submissions are linked to the specific mission and tracked in Google Sheets\\.\n\n' +
+      '/status \\- Show current missions\n\n' +
+      '*Template Commands:*\n' +
+      '/tm \\<name\\> \\[var\\=val\\] \\- Create mission from template\n' +
+      '/templates \\- List all templates\n' +
+      '/tnew \\- Create a new template\n' +
+      '/tview \\<name\\> \\- View template details\n' +
+      '/tdel \\<name\\> \\- Delete a template\n\n' +
+      '*Content Submissions \\(group chat\\):*\n' +
+      'Reply to a mission message with your URL to submit\\.\n\n' +
       '\\-\\-\\-\n' +
       '_Powered by Pyth Mission Control v2\\.0_',
       { parse_mode: 'MarkdownV2' }
     );
+  });
+
+  // ============================================================================
+  // Template Argument Parser
+  // ============================================================================
+
+  /**
+   * Parse "/tm weekly topic="Pyth V3" deadline_days=3" into
+   * { templateName: "weekly", variables: { topic: "Pyth V3", deadline_days: "3" } }
+   */
+  function parseTemplateArgs(input: string): { templateName: string; variables: Record<string, string> } {
+    const parts: string[] = [];
+    let current = '';
+    let inQuote = false;
+    let quoteChar = '';
+
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+      if (inQuote) {
+        if (ch === quoteChar) {
+          inQuote = false;
+        } else {
+          current += ch;
+        }
+      } else if (ch === '"' || ch === "'") {
+        inQuote = true;
+        quoteChar = ch;
+      } else if (ch === ' ') {
+        if (current) {
+          parts.push(current);
+          current = '';
+        }
+      } else {
+        current += ch;
+      }
+    }
+    if (current) parts.push(current);
+
+    const templateName = parts[0] || '';
+    const variables: Record<string, string> = {};
+    for (let i = 1; i < parts.length; i++) {
+      const eqIdx = parts[i].indexOf('=');
+      if (eqIdx > 0) {
+        variables[parts[i].slice(0, eqIdx)] = parts[i].slice(eqIdx + 1);
+      }
+    }
+    return { templateName, variables };
+  }
+
+  /**
+   * Parse key=value pairs from command text (for /tnew)
+   */
+  function parseKeyValueArgs(input: string): Record<string, string> {
+    const result: Record<string, string> = {};
+    const regex = /(\w+)=(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+    let match;
+    while ((match = regex.exec(input)) !== null) {
+      result[match[1]] = match[2] ?? match[3] ?? match[4];
+    }
+    return result;
+  }
+
+  // ============================================================================
+  // /tm Command — Create mission from template
+  // ============================================================================
+  telegramBot.command('tm', async (ctx) => {
+    console.log(`[Telegram] DEBUG: /tm command received from chat ${ctx.chat?.id}`);
+    if (!isPrivateChat(ctx)) return;
+
+    const rawArgs = ctx.match?.trim();
+    if (!rawArgs) {
+      await ctx.reply(
+        '*Usage:* /tm \\<template\\-name\\> \\[var\\=val \\.\\.\\.\\]\n\n' +
+        '*Example:*\n' +
+        '\\`/tm weekly topic\\="Pyth V3"\\`\n' +
+        '\\`/tm weekly topic\\="Pyth V3" deadline\\_days\\=3\\`',
+        { parse_mode: 'MarkdownV2' }
+      );
+      return;
+    }
+
+    const { templateName, variables } = parseTemplateArgs(rawArgs);
+    if (!templateName) {
+      await ctx.reply('*Error:* Please provide a template name\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+
+    const result = handleTemplateMissionCommand(templateName, variables);
+    if (!result.success) {
+      await ctx.reply(`*Error:* ${escapeMarkdown(result.error || 'Unknown error')}`, { parse_mode: 'MarkdownV2' });
+      return;
+    }
+
+    // Create Discord thread (same flow as /mission)
+    const progressMsg = await ctx.reply(
+      `_Creating mission from template "${escapeMarkdown(templateName)}"\\.\\.\\._`,
+      { parse_mode: 'MarkdownV2' }
+    );
+
+    try {
+      console.log(`[Telegram] Creating Discord thread from template: "${result.title}"`);
+      const template = getTemplateByName(templateName);
+      const roleIds = template?.roleIds ?? DEFAULT_MISSION_ROLE_IDS;
+      const threadResult = await createMissionThread(result.title, result.resolvedBrief, result.deadlineDays, { roleIds });
+
+      if (!threadResult.success) {
+        console.error(`[Telegram] Failed to create Discord thread: ${threadResult.error}`);
+        await ctx.reply(
+          `*Error:* Discord thread creation failed: ${escapeMarkdown(threadResult.error || 'Unknown error')}`,
+          { parse_mode: 'MarkdownV2' }
+        );
+        return;
+      }
+
+      console.log(`[Telegram] Discord thread created: ${threadResult.threadId}`);
+
+      // Delete progress message
+      await ctx.api.deleteMessage(ctx.chat!.id, progressMsg.message_id);
+
+      // Build Telegram announcement
+      let announcementText: string;
+      if (result.announcementText) {
+        announcementText = escapeMarkdown(result.announcementText);
+      } else {
+        const briefPreview = result.resolvedBrief.length > 300
+          ? result.resolvedBrief.slice(0, 300) + '...'
+          : result.resolvedBrief;
+        const deadlineDate = new Date(Date.now() + result.deadlineDays * 24 * 60 * 60 * 1000);
+        const deadlineStr = deadlineDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+        announcementText =
+          `🎯 *MISSION: ${escapeMarkdown(result.title)}*\n\n` +
+          `${escapeMarkdown(briefPreview)}\n\n` +
+          `━`.repeat(35) + `\n` +
+          `⏰ *Deadline:* ${escapeMarkdown(deadlineStr)}\n` +
+          `📝 Reply to this message with your URL to submit\\.`;
+      }
+
+      // Post announcement
+      const announcementChannelId = config.telegramAnnouncementChannelId;
+      let missionAnnouncement;
+      let announcementChatId: string;
+
+      if (announcementChannelId) {
+        try {
+          missionAnnouncement = await ctx.api.sendMessage(
+            announcementChannelId,
+            announcementText,
+            { parse_mode: 'MarkdownV2' }
+          );
+          announcementChatId = announcementChannelId;
+          console.log(`[Telegram] Template mission announcement posted to channel ${announcementChannelId}`);
+        } catch (error) {
+          console.error(`[Telegram] Failed to post to announcement channel:`, error);
+          await ctx.reply(
+            `⚠️ *Warning:* Could not post to announcement channel\\. Check bot permissions\\.`,
+            { parse_mode: 'MarkdownV2' }
+          );
+          return;
+        }
+      } else {
+        missionAnnouncement = await ctx.reply(announcementText, { parse_mode: 'MarkdownV2' });
+        announcementChatId = ctx.chat!.id.toString();
+      }
+
+      // Link mission to Telegram
+      if (threadResult.threadId) {
+        const mission = getMissionByThread(threadResult.threadId);
+        if (mission) {
+          updateMissionTelegramInfo(
+            mission.id,
+            missionAnnouncement.message_id.toString(),
+            announcementChatId
+          );
+        }
+      }
+
+      // Confirm success
+      if (announcementChannelId) {
+        await ctx.reply(
+          `✅ *Mission created from template "${escapeMarkdown(templateName)}"\\!*\n\n` +
+          `• Discord thread created\n` +
+          `• Announcement posted to Telegram channel\n\n` +
+          `📝 Users can submit by replying to the mission announcement with their URL\\.`,
+          { parse_mode: 'MarkdownV2' }
+        );
+      } else {
+        await ctx.reply(
+          `✅ *Mission created from template "${escapeMarkdown(templateName)}"\\!*\n\n` +
+          `📝 *To submit:* Reply to the mission message above with your URL\\.`,
+          { parse_mode: 'MarkdownV2' }
+        );
+      }
+
+    } catch (error) {
+      console.error('[Telegram] /tm command error:', error);
+      await ctx.reply('*Error:* Something went wrong\\. Please try again\\.', { parse_mode: 'MarkdownV2' });
+    }
+  });
+
+  // ============================================================================
+  // /templates Command — List all templates
+  // ============================================================================
+  telegramBot.command('templates', async (ctx) => {
+    console.log(`[Telegram] DEBUG: /templates command received`);
+    if (!isPrivateChat(ctx)) return;
+
+    const result = handleListTemplatesCommand();
+    await ctx.reply(result.message!, { parse_mode: 'MarkdownV2' });
+  });
+
+  // ============================================================================
+  // /tnew Command — Create a new template
+  // ============================================================================
+  telegramBot.command('tnew', async (ctx) => {
+    console.log(`[Telegram] DEBUG: /tnew command received from chat ${ctx.chat?.id}`);
+    if (!isPrivateChat(ctx)) return;
+
+    const rawArgs = ctx.match?.trim() || '';
+    const args = parseKeyValueArgs(rawArgs);
+
+    if (!args.name) {
+      await ctx.reply(
+        '*Usage:* Reply to a message with the brief text, then:\n' +
+        '\\`/tnew name\\=weekly deadline\\=7\\`\n\n' +
+        'Or inline:\n' +
+        '\\`/tnew name\\=weekly deadline\\=7 brief\\="Your brief text"\\`',
+        { parse_mode: 'MarkdownV2' }
+      );
+      return;
+    }
+
+    // Get brief content from reply or inline
+    let briefContent = args.brief;
+    if (!briefContent) {
+      const replyText = ctx.message?.reply_to_message?.text;
+      if (!replyText) {
+        await ctx.reply(
+          '*Error:* No brief content\\. Either reply to a message containing the brief, or use `brief\\="your text"`\\.',
+          { parse_mode: 'MarkdownV2' }
+        );
+        return;
+      }
+      briefContent = replyText;
+    }
+
+    const deadlineDays = args.deadline ? parseInt(args.deadline, 10) : 7;
+    if (isNaN(deadlineDays) || deadlineDays < 1) {
+      await ctx.reply('*Error:* Deadline must be a positive number of days\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+
+    const result = handleCreateTemplateCommand({
+      name: args.name,
+      briefContent,
+      defaultDeadlineDays: deadlineDays,
+      claudePromptOverride: args.prompt,
+      announcementFormat: args.announcement,
+    });
+
+    if (result.success) {
+      await ctx.reply(result.message!, { parse_mode: 'MarkdownV2' });
+    } else {
+      await ctx.reply(`*Error:* ${escapeMarkdown(result.error || 'Unknown error')}`, { parse_mode: 'MarkdownV2' });
+    }
+  });
+
+  // ============================================================================
+  // /tview Command — View template details
+  // ============================================================================
+  telegramBot.command('tview', async (ctx) => {
+    console.log(`[Telegram] DEBUG: /tview command received`);
+    if (!isPrivateChat(ctx)) return;
+
+    const name = ctx.match?.trim();
+    if (!name) {
+      await ctx.reply('*Usage:* /tview \\<template\\-name\\>', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+
+    const result = handleViewTemplateCommand(name);
+    if (result.success) {
+      await ctx.reply(result.message!, { parse_mode: 'MarkdownV2' });
+    } else {
+      await ctx.reply(`*Error:* ${escapeMarkdown(result.error || 'Unknown error')}`, { parse_mode: 'MarkdownV2' });
+    }
+  });
+
+  // ============================================================================
+  // /tdel Command — Delete a template
+  // ============================================================================
+  telegramBot.command('tdel', async (ctx) => {
+    console.log(`[Telegram] DEBUG: /tdel command received`);
+    if (!isPrivateChat(ctx)) return;
+
+    const name = ctx.match?.trim();
+    if (!name) {
+      await ctx.reply('*Usage:* /tdel \\<template\\-name\\>', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+
+    const result = handleDeleteTemplateCommand(name);
+    if (result.success) {
+      await ctx.reply(result.message!, { parse_mode: 'MarkdownV2' });
+    } else {
+      await ctx.reply(`*Error:* ${escapeMarkdown(result.error || 'Unknown error')}`, { parse_mode: 'MarkdownV2' });
+    }
+  });
+
+  // ============================================================================
+  // /create Command — Create mission from replied-to brief message
+  // ============================================================================
+  telegramBot.command('create', async (ctx) => {
+    console.log(`[Telegram] DEBUG: /create command received from chat ${ctx.chat?.id}`);
+    if (!isPrivateChat(ctx)) return;
+
+    // Must be a reply to a message containing the brief
+    const replyText = ctx.message?.reply_to_message?.text;
+    if (!replyText) {
+      await ctx.reply(
+        '*Usage:* Send your mission brief as a message, then reply to it with:\n' +
+        '\\`/create title\\="Mission Title" deadline\\=3\\`\n\n' +
+        '_deadline is in days \\(default: 7\\)_',
+        { parse_mode: 'MarkdownV2' }
+      );
+      return;
+    }
+
+    const rawArgs = ctx.match?.trim() || '';
+    const args = parseKeyValueArgs(rawArgs);
+
+    if (!args.title) {
+      await ctx.reply(
+        '*Error:* title is required\\.\n\n' +
+        '*Example:* \\`/create title\\="Pyth V3 Launch" deadline\\=3\\`',
+        { parse_mode: 'MarkdownV2' }
+      );
+      return;
+    }
+
+    const title = args.title;
+    const deadlineDays = args.deadline ? parseInt(args.deadline, 10) : 7;
+    if (isNaN(deadlineDays) || deadlineDays < 1) {
+      await ctx.reply('*Error:* Deadline must be a positive number of days\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+
+    const progressMsg = await ctx.reply(
+      `_Creating mission "${escapeMarkdown(title)}"\\.\\.\\._`,
+      { parse_mode: 'MarkdownV2' }
+    );
+
+    try {
+      // Create Discord thread with embed + role pings
+      console.log(`[Telegram] /create creating Discord thread: "${title}"`);
+      const threadResult = await createMissionThread(title, replyText, deadlineDays, { roleIds: DEFAULT_MISSION_ROLE_IDS });
+
+      if (!threadResult.success) {
+        console.error(`[Telegram] Failed to create Discord thread: ${threadResult.error}`);
+        await ctx.reply(
+          `*Error:* Discord thread creation failed: ${escapeMarkdown(threadResult.error || 'Unknown error')}`,
+          { parse_mode: 'MarkdownV2' }
+        );
+        return;
+      }
+
+      console.log(`[Telegram] Discord thread created: ${threadResult.threadId}`);
+
+      // Delete progress message
+      await ctx.api.deleteMessage(ctx.chat!.id, progressMsg.message_id);
+
+      // Build Telegram announcement
+      const briefPreview = replyText.length > 300
+        ? replyText.slice(0, 300) + '...'
+        : replyText;
+      const deadlineDate = new Date(Date.now() + deadlineDays * 24 * 60 * 60 * 1000);
+      const deadlineStr = deadlineDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+      const announcementText =
+        `🎯 *MISSION: ${escapeMarkdown(title)}*\n\n` +
+        `${escapeMarkdown(briefPreview)}\n\n` +
+        `━`.repeat(35) + `\n` +
+        `⏰ *Deadline:* ${escapeMarkdown(deadlineStr)}\n` +
+        `📝 Reply to this message with your URL to submit\\.`;
+
+      // Post announcement to group
+      const announcementChannelId = config.telegramAnnouncementChannelId;
+      let missionAnnouncement;
+      let announcementChatId: string;
+
+      if (announcementChannelId) {
+        try {
+          missionAnnouncement = await ctx.api.sendMessage(
+            announcementChannelId,
+            announcementText,
+            { parse_mode: 'MarkdownV2' }
+          );
+          announcementChatId = announcementChannelId;
+          console.log(`[Telegram] /create announcement posted to channel ${announcementChannelId}`);
+        } catch (error) {
+          console.error(`[Telegram] Failed to post to announcement channel:`, error);
+          await ctx.reply(
+            `⚠️ *Warning:* Could not post to announcement channel\\. Check bot permissions\\.`,
+            { parse_mode: 'MarkdownV2' }
+          );
+          return;
+        }
+      } else {
+        missionAnnouncement = await ctx.reply(announcementText, { parse_mode: 'MarkdownV2' });
+        announcementChatId = ctx.chat!.id.toString();
+      }
+
+      // Link mission to Telegram
+      if (threadResult.threadId) {
+        const mission = getMissionByThread(threadResult.threadId);
+        if (mission) {
+          updateMissionTelegramInfo(
+            mission.id,
+            missionAnnouncement.message_id.toString(),
+            announcementChatId
+          );
+        }
+      }
+
+      // Confirm success in DM
+      await ctx.reply(
+        `✅ *Mission created\\!*\n\n` +
+        `• Discord thread created with role pings\n` +
+        `• Announcement posted to Telegram channel\n\n` +
+        `📝 Users can submit by replying to the mission announcement with their URL\\.`,
+        { parse_mode: 'MarkdownV2' }
+      );
+
+    } catch (error) {
+      console.error('[Telegram] /create command error:', error);
+      await ctx.reply('*Error:* Something went wrong\\. Please try again\\.', { parse_mode: 'MarkdownV2' });
+    }
   });
 
   // ============================================================================

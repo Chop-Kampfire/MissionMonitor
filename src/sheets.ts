@@ -92,9 +92,21 @@ async function ensureMissionSheet(mission: Mission): Promise<any> {
   let sheet = doc.sheetsByTitle[sheetTitle];
 
   if (!sheet) {
-    sheet = await doc.addSheet({ title: sheetTitle });
-    await sheet.setHeaderRow(SHEET_HEADERS);
-    console.log(`[Sheets] Created new sheet: ${sheetTitle}`);
+    try {
+      sheet = await doc.addSheet({ title: sheetTitle });
+      await sheet.setHeaderRow(SHEET_HEADERS);
+      console.log(`[Sheets] Created new sheet: ${sheetTitle}`);
+    } catch (e: any) {
+      // Sheet may already exist (stale cache) - reload and retry
+      if (e?.message?.includes('already exists') || e?.response?.data?.error?.message?.includes('already exists')) {
+        console.log(`[Sheets] Sheet "${sheetTitle}" already exists, reloading...`);
+        await doc.loadInfo();
+        sheet = doc.sheetsByTitle[sheetTitle];
+        if (!sheet) throw e; // genuinely missing, re-throw
+      } else {
+        throw e;
+      }
+    }
   } else {
     // Verify headers match (older sheets may be missing the Source column)
     await sheet.loadHeaderRow();

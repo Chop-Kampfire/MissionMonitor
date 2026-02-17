@@ -62,7 +62,7 @@ export function loadConfig(): BotConfig {
     // Discord
     discordBotToken: requireEnv('DISCORD_BOT_TOKEN'),
     discordGuildId: optionalEnv('DISCORD_GUILD_ID', '826115122799837205'),
-    discordMissionChannelId: optionalEnv('DISCORD_MISSION_CHANNEL_ID', '1308506959032488067'),
+    discordMissionChannelId: optionalEnv('DISCORD_MISSION_CHANNEL_ID', '1472788248852955167'),
     discordResultsChannelId: optionalEnv('DISCORD_RESULTS_CHANNEL_ID', '1308505757637021817'),
     discordJudgeRoleIds: parseArray(optionalEnv('DISCORD_JUDGE_ROLE_IDS', '1351377449744728105')),
 

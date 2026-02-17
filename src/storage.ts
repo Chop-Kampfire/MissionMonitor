@@ -12,6 +12,7 @@ import * as path from 'path';
 const STORAGE_DIR = path.join(__dirname, '..', 'data');
 const SUBMISSIONS_FILE = path.join(STORAGE_DIR, 'submissions.json');
 const MISSIONS_FILE = path.join(STORAGE_DIR, 'missions.json');
+const TEMPLATES_FILE = path.join(STORAGE_DIR, 'templates.json');
 
 // ============================================================================
 // Types
@@ -52,12 +53,28 @@ export interface Submission {
   source: 'discord' | 'telegram'; // Where submission came from
 }
 
+export interface MissionTemplate {
+  id: string;
+  name: string;
+  briefContent: string;
+  defaultDeadlineDays: number;
+  claudePromptOverride?: string;
+  announcementFormat?: string;
+  roleIds?: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface SubmissionsData {
   submissions: Submission[];
 }
 
 interface MissionsData {
   missions: Mission[];
+}
+
+interface TemplatesData {
+  templates: MissionTemplate[];
 }
 
 // ============================================================================
@@ -349,4 +366,130 @@ export function markSubmissionsExported(missionId: string): void {
     }
   });
   saveSubmissions(data);
+}
+
+// ============================================================================
+// Template Functions
+// ============================================================================
+
+function loadTemplates(): TemplatesData {
+  ensureStorageDir();
+  if (!fs.existsSync(TEMPLATES_FILE)) {
+    return { templates: [] };
+  }
+  const content = fs.readFileSync(TEMPLATES_FILE, 'utf-8');
+  return JSON.parse(content);
+}
+
+function saveTemplates(data: TemplatesData): void {
+  ensureStorageDir();
+  fs.writeFileSync(TEMPLATES_FILE, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+/**
+ * Create a new mission template
+ */
+export function createTemplate(input: {
+  name: string;
+  briefContent: string;
+  defaultDeadlineDays: number;
+  claudePromptOverride?: string;
+  announcementFormat?: string;
+}): MissionTemplate {
+  const data = loadTemplates();
+
+  // Check for duplicate name (case-insensitive)
+  const existing = data.templates.find(
+    t => t.name.toLowerCase() === input.name.toLowerCase()
+  );
+  if (existing) {
+    throw new Error(`Template "${input.name}" already exists.`);
+  }
+
+  const template: MissionTemplate = {
+    id: `tmpl-${Date.now()}`,
+    name: input.name,
+    briefContent: input.briefContent,
+    defaultDeadlineDays: input.defaultDeadlineDays,
+    claudePromptOverride: input.claudePromptOverride,
+    announcementFormat: input.announcementFormat,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  data.templates.push(template);
+  saveTemplates(data);
+  console.log(`[Storage] Template created: ${template.id} - "${template.name}"`);
+  return template;
+}
+
+/**
+ * Get template by name (case-insensitive)
+ */
+export function getTemplateByName(name: string): MissionTemplate | null {
+  const data = loadTemplates();
+  return data.templates.find(
+    t => t.name.toLowerCase() === name.toLowerCase()
+  ) || null;
+}
+
+/**
+ * Get all templates sorted by createdAt desc
+ */
+export function getAllTemplates(): MissionTemplate[] {
+  const data = loadTemplates();
+  return data.templates.sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+}
+
+/**
+ * Update a template by ID
+ */
+export function updateTemplate(
+  id: string,
+  updates: Partial<Pick<MissionTemplate, 'name' | 'briefContent' | 'defaultDeadlineDays' | 'claudePromptOverride' | 'announcementFormat'>>
+): MissionTemplate | null {
+  const data = loadTemplates();
+  const template = data.templates.find(t => t.id === id);
+  if (!template) return null;
+
+  // If renaming, check for conflicts
+  if (updates.name && updates.name.toLowerCase() !== template.name.toLowerCase()) {
+    const conflict = data.templates.find(
+      t => t.id !== id && t.name.toLowerCase() === updates.name!.toLowerCase()
+    );
+    if (conflict) {
+      throw new Error(`Template "${updates.name}" already exists.`);
+    }
+  }
+
+  Object.assign(template, updates, { updatedAt: new Date().toISOString() });
+  saveTemplates(data);
+  console.log(`[Storage] Template updated: ${template.id} - "${template.name}"`);
+  return template;
+}
+
+/**
+ * Delete a template by ID
+ */
+export function deleteTemplate(id: string): boolean {
+  const data = loadTemplates();
+  const index = data.templates.findIndex(t => t.id === id);
+  if (index < 0) return false;
+
+  const removed = data.templates.splice(index, 1)[0];
+  saveTemplates(data);
+  console.log(`[Storage] Template deleted: ${removed.id} - "${removed.name}"`);
+  return true;
+}
+
+/**
+ * Resolve {{placeholder}} variables in template text
+ */
+export function resolveTemplateVariables(
+  text: string,
+  vars: Record<string, string>
+): string {
+  return text.replace(/\{\{(\w+)\}\}/g, (match, key) => vars[key] ?? match);
 }

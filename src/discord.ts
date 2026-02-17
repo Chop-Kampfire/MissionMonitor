@@ -15,6 +15,7 @@ import {
   TextChannel,
   ThreadChannel,
   ChannelType,
+  EmbedBuilder,
 } from 'discord.js';
 import { config } from './config';
 import {
@@ -54,6 +55,14 @@ const VOTE_EMOJI_ORDER = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣']
 
 const CONFIRMATION_EMOJI = '📝';
 
+// Default Discord role IDs to ping when a mission is created
+export const DEFAULT_MISSION_ROLE_IDS = [
+  '1140405262809845870', // High Priest
+  '862987308223037440',  // Priest
+  '862987953230577705',  // Low Priest
+  '1299084918382395443', // Pythenians
+];
+
 // In-memory index for quick message -> submission lookups
 // This is rebuilt on each message, file storage is source of truth
 const messageToSubmissionId = new Map<string, string>();
@@ -83,7 +92,7 @@ discordClient.on(Events.MessageCreate, async (message) => {
   console.log(`[Discord] DEBUG: - Content preview: "${message.content.substring(0, 100)}${message.content.length > 100 ? '...' : ''}"`);
 
   // Ignore bot messages
-  if (message.author.bot) {
+  if (message.author.bot && !message.webhookId) {
     console.log(`[Discord] DEBUG: Ignoring bot message`);
     return;
   }
@@ -129,6 +138,17 @@ discordClient.on(Events.MessageCreate, async (message) => {
       mission = registerMission(thread.id, thread.name, defaultDeadline);
     }
 
+    // Reject submissions to closed missions
+    if (mission.status !== 'active') {
+      console.log(`[Discord] Submission rejected: mission "${mission.title}" is ${mission.status}`);
+      try {
+        await message.reply(`This mission is closed and no longer accepting submissions.`);
+      } catch (e) {
+        console.error('[Discord] Failed to send closed mission reply:', e);
+      }
+      return;
+    }
+
     // Create submission in file storage
     const submission = createSubmission(
       message.id,
@@ -163,6 +183,24 @@ discordClient.on(Events.MessageCreate, async (message) => {
         await message.react(emoji);
       }
       console.log(`[Discord] Vote reactions pre-created on submission: ${message.id}`);
+
+      // Send confirmation embed
+      const submissionCount = getSubmissionsByMission(mission.id).length;
+      const displayUrl = urls[0].length > 60
+        ? `[View Submission](${urls[0]})`
+        : urls[0];
+      const confirmEmbed = new EmbedBuilder()
+        .setColor(0x22C55E)
+        .setTitle('✅ SUBMISSION RECEIVED')
+        .addFields(
+          { name: 'Agent', value: `<@${message.author.id}>`, inline: true },
+          { name: 'Link', value: displayUrl, inline: true },
+        )
+        .setDescription('Judges: react 1️⃣–5️⃣ above to score this entry.')
+        .setFooter({ text: `📝 Submission #${submissionCount}` })
+        .setTimestamp();
+      await message.channel.send({ embeds: [confirmEmbed] });
+      console.log(`[Discord] Submission confirmation embed sent: #${submissionCount}`);
     } catch (error) {
       console.error('[Discord] Failed to add reactions:', error);
     }
@@ -314,7 +352,8 @@ discordClient.on(Events.MessageReactionRemove, async (reaction, user) => {
 export async function createMissionThread(
   title: string,
   briefContent: string,
-  deadlineDays: number = 7
+  deadlineDays: number = 7,
+  options?: { roleIds?: string[] }
 ): Promise<{ success: boolean; threadId?: string; error?: string }> {
   console.log(`[Discord] DEBUG: createMissionThread called - title="${title}"`);
 
@@ -345,13 +384,48 @@ export async function createMissionThread(
 
     console.log(`[Discord] Thread created: ${thread.id} - "${threadName}"`);
 
-    // Post the mission brief as the first message
-    await thread.send(briefContent);
-    console.log(`[Discord] Mission brief posted to thread`);
-
-    // Register the mission in storage
+    // Compute deadline and format Discord timestamp
     const deadline = new Date();
     deadline.setDate(deadline.getDate() + deadlineDays);
+    const deadlineEpoch = Math.floor(deadline.getTime() / 1000);
+
+    // Send role pings as a separate message (embeds don't trigger notifications)
+    const roleIds = options?.roleIds ?? DEFAULT_MISSION_ROLE_IDS;
+    if (roleIds.length > 0) {
+      const rolePings = roleIds.map(id => `<@&${id}>`).join(' ');
+      await thread.send(rolePings);
+      console.log(`[Discord] Role pings sent: ${roleIds.length} roles`);
+    }
+
+    // Build and send rich embed — quest briefing style
+    const embed = new EmbedBuilder()
+      .setColor(0x7C3AED)
+      .setTitle('⚔️  NEW MISSION DEPLOYED')
+      .setDescription(
+        `**${title}**\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `📋 **BRIEFING**\n${briefContent}\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
+      )
+      .addFields(
+        { name: '⏰ Deadline', value: `<t:${deadlineEpoch}:F>\n(<t:${deadlineEpoch}:R>)`, inline: true },
+        { name: '📊 Status', value: '🟢 **ACTIVE**', inline: true },
+      )
+      .addFields({
+        name: '\u200B',
+        value: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+      })
+      .addFields({
+        name: '🎯 HOW TO PARTICIPATE',
+        value: 'Post your submission link in this thread.\nJudges will score entries from 1–5.',
+      })
+      .setFooter({ text: 'Mission Control' })
+      .setTimestamp();
+
+    await thread.send({ embeds: [embed] });
+    console.log(`[Discord] Mission embed posted to thread`);
+
+    // Register the mission in storage (store original brief without timestamp)
     registerMission(thread.id, title, deadline, briefContent);
 
     return { success: true, threadId: thread.id };
@@ -399,6 +473,184 @@ export async function closeThread(threadId: string): Promise<boolean> {
     return false;
   } catch (error) {
     console.error(`[Discord] Failed to close thread ${threadId}:`, error);
+    return false;
+  }
+}
+
+// ============================================================================
+// Mission Announcements
+// ============================================================================
+
+/**
+ * Build a rich embed summary for posting in the mission thread when it closes
+ */
+function buildMissionSummaryEmbed(mission: Mission, submissions: Submission[]): EmbedBuilder {
+  const scored = submissions
+    .map(s => {
+      const scores = s.votes.map(v => v.score);
+      const avg = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : -1;
+      return { submission: s, avg, voteCount: scores.length };
+    })
+    .sort((a, b) => b.avg - a.avg);
+
+  const top3 = scored.slice(0, 3).filter(s => s.avg >= 0);
+
+  // Count unique judges
+  const judgeIds = new Set<string>();
+  submissions.forEach(s => s.votes.forEach(v => judgeIds.add(v.judgeId)));
+
+  let leaderboard = '*No scored submissions*';
+  if (top3.length > 0) {
+    const medals = ['🥇', '🥈', '🥉'];
+    leaderboard = top3.map((entry, i) =>
+      `${medals[i]} <@${entry.submission.userId}> — ⭐ ${entry.avg.toFixed(1)}  (${entry.voteCount} vote${entry.voteCount !== 1 ? 's' : ''})`
+    ).join('\n');
+  }
+
+  return new EmbedBuilder()
+    .setColor(0xF59E0B)
+    .setTitle('🏆 MISSION COMPLETE')
+    .setDescription(
+      `**"${mission.title}"**\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
+    )
+    .addFields(
+      { name: '📊 Submissions', value: `**${submissions.length}**`, inline: true },
+      { name: '⚖️ Judges Voted', value: `**${judgeIds.size}**`, inline: true },
+    )
+    .addFields({
+      name: '\u200B',
+      value: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+    })
+    .addFields({
+      name: '🏅 LEADERBOARD',
+      value: leaderboard,
+    })
+    .addFields({
+      name: '\u200B',
+      value: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nThis thread is now locked. Thanks to all operatives! 🫡',
+    })
+    .setFooter({ text: 'Mission Control' })
+    .setTimestamp();
+}
+
+/**
+ * Build a rich embed of mission results for posting to the results channel
+ */
+function buildMissionResultsEmbed(mission: Mission, submissions: Submission[]): EmbedBuilder {
+  const threadLink = `https://discord.com/channels/${config.discordGuildId}/${mission.threadId}`;
+
+  const scored = submissions
+    .map(s => {
+      const scores = s.votes.map(v => v.score);
+      const avg = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : -1;
+      return { submission: s, avg, voteCount: scores.length };
+    })
+    .sort((a, b) => b.avg - a.avg);
+
+  const top3 = scored.slice(0, 3).filter(s => s.avg >= 0);
+  const medals = ['🥇', '🥈', '🥉'];
+  const places = ['1st Place', '2nd Place', '3rd Place'];
+
+  const embed = new EmbedBuilder()
+    .setColor(0x7C3AED)
+    .setTitle('📢 MISSION RESULTS')
+    .setDescription(
+      `**"${mission.title}"**\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
+    );
+
+  if (top3.length > 0) {
+    for (let i = 0; i < top3.length; i++) {
+      const entry = top3[i];
+      const url = entry.submission.urls[0] || '';
+      const linkLine = url ? `\n🔗 ${url}` : '';
+      embed.addFields({
+        name: `${medals[i]} ${places[i]}`,
+        value: `<@${entry.submission.userId}> — ⭐ ${entry.avg.toFixed(1)} avg (${entry.voteCount} vote${entry.voteCount !== 1 ? 's' : ''})${linkLine}`,
+      });
+    }
+  } else {
+    embed.addFields({
+      name: '🏅 Results',
+      value: '*No scored submissions*',
+    });
+  }
+
+  embed.addFields({
+    name: '\u200B',
+    value: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+  });
+
+  embed.addFields(
+    { name: '📊 Total Submissions', value: `**${submissions.length}**`, inline: true },
+    { name: '🧵 Mission Thread', value: `[View Thread](${threadLink})`, inline: true },
+  );
+
+  embed.setFooter({ text: 'Mission Control' })
+    .setTimestamp();
+
+  return embed;
+}
+
+/**
+ * Post mission summary to the mission thread (before locking)
+ */
+export async function postMissionSummaryToThread(
+  threadId: string,
+  mission: Mission,
+  submissions: Submission[]
+): Promise<boolean> {
+  try {
+    let thread = discordClient.channels.cache.get(threadId) as ThreadChannel | undefined;
+    if (!thread) {
+      thread = await discordClient.channels.fetch(threadId) as ThreadChannel | undefined;
+    }
+    if (!thread || !thread.isThread()) {
+      console.warn(`[Discord] Could not find thread ${threadId} for summary`);
+      return false;
+    }
+
+    // Unarchive if needed so we can post
+    if (thread.archived) {
+      await thread.setArchived(false);
+    }
+
+    const summaryEmbed = buildMissionSummaryEmbed(mission, submissions);
+    await thread.send({ embeds: [summaryEmbed] });
+    console.log(`[Discord] Posted mission summary to thread ${threadId}`);
+    return true;
+  } catch (error) {
+    console.error(`[Discord] Failed to post summary to thread ${threadId}:`, error);
+    return false;
+  }
+}
+
+/**
+ * Post mission results to the results channel
+ */
+export async function postMissionResultsToChannel(
+  mission: Mission,
+  submissions: Submission[]
+): Promise<boolean> {
+  try {
+    const channel = discordClient.channels.cache.get(config.discordResultsChannelId);
+    if (!channel) {
+      console.warn(`[Discord] Results channel ${config.discordResultsChannelId} not found`);
+      return false;
+    }
+
+    if (!channel.isTextBased()) {
+      console.warn(`[Discord] Results channel is not text-based`);
+      return false;
+    }
+
+    const resultsEmbed = buildMissionResultsEmbed(mission, submissions);
+    await (channel as TextChannel).send({ embeds: [resultsEmbed] });
+    console.log(`[Discord] Posted mission results to results channel`);
+    return true;
+  } catch (error) {
+    console.error(`[Discord] Failed to post results to channel:`, error);
     return false;
   }
 }
