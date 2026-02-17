@@ -184,23 +184,7 @@ discordClient.on(Events.MessageCreate, async (message) => {
       }
       console.log(`[Discord] Vote reactions pre-created on submission: ${message.id}`);
 
-      // Send confirmation embed
-      const submissionCount = getSubmissionsByMission(mission.id).length;
-      const displayUrl = urls[0].length > 60
-        ? `[View Submission](${urls[0]})`
-        : urls[0];
-      const confirmEmbed = new EmbedBuilder()
-        .setColor(0x22C55E)
-        .setTitle('✅ SUBMISSION RECEIVED')
-        .addFields(
-          { name: 'Agent', value: `<@${message.author.id}>`, inline: true },
-          { name: 'Link', value: displayUrl, inline: true },
-        )
-        .setDescription('Judges: react 1️⃣–5️⃣ above to score this entry.')
-        .setFooter({ text: `📝 Submission #${submissionCount}` })
-        .setTimestamp();
-      await message.channel.send({ embeds: [confirmEmbed] });
-      console.log(`[Discord] Submission confirmation embed sent: #${submissionCount}`);
+      console.log(`[Discord] Submission confirmed with reactions: ${message.id}`);
     } catch (error) {
       console.error('[Discord] Failed to add reactions:', error);
     }
@@ -375,8 +359,41 @@ export async function createMissionThread(
     // Create thread name (limit to 100 chars)
     const threadName = title.length > 97 ? title.substring(0, 97) + '...' : title;
 
-    // Create a public thread
-    const thread = await textChannel.threads.create({
+    // Compute deadline
+    const deadline = new Date();
+    deadline.setDate(deadline.getDate() + deadlineDays);
+    const deadlineEpoch = Math.floor(deadline.getTime() / 1000);
+
+    // Truncate brief for the channel-visible starter message
+    const maxBriefLen = 280;
+    const shortBrief = briefContent.length > maxBriefLen
+      ? briefContent.substring(0, maxBriefLen).replace(/\s+\S*$/, '') + '...'
+      : briefContent;
+
+    // Build channel-visible starter embed (compact)
+    const starterEmbed = new EmbedBuilder()
+      .setColor(0x7C3AED)
+      .setTitle(`⚔️  ${title.toUpperCase()}`)
+      .setDescription(
+        `${shortBrief}\n\n` +
+        `⏰ <t:${deadlineEpoch}:R>  ·  🟢 **ACTIVE**`
+      )
+      .setFooter({ text: 'Open thread to see full briefing & submit' });
+
+    // Send starter message to channel, then create thread from it
+    const roleIds = options?.roleIds ?? DEFAULT_MISSION_ROLE_IDS;
+    const rolePings = roleIds.length > 0
+      ? roleIds.map(id => `<@&${id}>`).join(' ')
+      : '';
+
+    const starterMessage = await textChannel.send({
+      content: rolePings || undefined,
+      embeds: [starterEmbed],
+    });
+    console.log(`[Discord] Starter message sent: ${starterMessage.id}`);
+
+    // Create thread from the starter message
+    const thread = await starterMessage.startThread({
       name: threadName,
       autoArchiveDuration: 10080, // 7 days
       reason: 'Mission created via Telegram bot',
@@ -384,37 +401,18 @@ export async function createMissionThread(
 
     console.log(`[Discord] Thread created: ${thread.id} - "${threadName}"`);
 
-    // Compute deadline and format Discord timestamp
-    const deadline = new Date();
-    deadline.setDate(deadline.getDate() + deadlineDays);
-    const deadlineEpoch = Math.floor(deadline.getTime() / 1000);
-
-    // Send role pings as a separate message (embeds don't trigger notifications)
-    const roleIds = options?.roleIds ?? DEFAULT_MISSION_ROLE_IDS;
-    if (roleIds.length > 0) {
-      const rolePings = roleIds.map(id => `<@&${id}>`).join(' ');
-      await thread.send(rolePings);
-      console.log(`[Discord] Role pings sent: ${roleIds.length} roles`);
-    }
-
-    // Build and send rich embed — quest briefing style
+    // Full briefing embed inside the thread
     const embed = new EmbedBuilder()
       .setColor(0x7C3AED)
-      .setTitle('⚔️  NEW MISSION DEPLOYED')
+      .setTitle('📋  FULL BRIEFING')
       .setDescription(
-        `**${title}**\n\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-        `📋 **BRIEFING**\n${briefContent}\n\n` +
+        `${briefContent}\n\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
       )
       .addFields(
         { name: '⏰ Deadline', value: `<t:${deadlineEpoch}:F>\n(<t:${deadlineEpoch}:R>)`, inline: true },
         { name: '📊 Status', value: '🟢 **ACTIVE**', inline: true },
       )
-      .addFields({
-        name: '\u200B',
-        value: '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-      })
       .addFields({
         name: '🎯 HOW TO PARTICIPATE',
         value: 'Post your submission link in this thread.\nJudges will score entries from 1–5.',
@@ -425,7 +423,7 @@ export async function createMissionThread(
     await thread.send({ embeds: [embed] });
     console.log(`[Discord] Mission embed posted to thread`);
 
-    // Register the mission in storage (store original brief without timestamp)
+    // Register the mission in storage
     registerMission(thread.id, title, deadline, briefContent);
 
     return { success: true, threadId: thread.id };

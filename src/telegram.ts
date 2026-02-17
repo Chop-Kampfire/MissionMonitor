@@ -98,6 +98,27 @@ async function sendLongMessage(ctx: Context, text: string, parseMode: 'MarkdownV
 }
 
 /**
+ * Download a file from Telegram by file ID and return its content as a UTF-8 string
+ */
+async function downloadTelegramFile(fileId: string, token: string): Promise<string> {
+  const fetch = (await import('node-fetch')).default;
+  const res = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`, {
+    agent: ipv4Agent as any,
+  });
+  const data = (await res.json()) as any;
+  if (!data.ok || !data.result?.file_path) {
+    throw new Error(`Failed to get file path: ${JSON.stringify(data)}`);
+  }
+  const fileRes = await fetch(`https://api.telegram.org/file/bot${token}/${data.result.file_path}`, {
+    agent: ipv4Agent as any,
+  });
+  if (!fileRes.ok) {
+    throw new Error(`Failed to download file: ${fileRes.statusText}`);
+  }
+  return await fileRes.text();
+}
+
+/**
  * Format mission brief for Telegram
  */
 function formatMissionBrief(brief: MissionBriefResult, sourceCount: number): string {
@@ -873,11 +894,26 @@ export async function startTelegramBot(): Promise<void> {
     console.log(`[Telegram] DEBUG: /create command received from chat ${ctx.chat?.id}`);
     if (!isPrivateChat(ctx)) return;
 
-    // Must be a reply to a message containing the brief
-    const replyText = ctx.message?.reply_to_message?.text;
+    // Must be a reply to a message containing the brief (text or .md file)
+    let replyText = ctx.message?.reply_to_message?.text;
+
+    // If no text, check for a .md document attachment
+    if (!replyText) {
+      const doc = (ctx.message?.reply_to_message as any)?.document;
+      if (doc && doc.file_name && doc.file_name.endsWith('.md')) {
+        try {
+          replyText = await downloadTelegramFile(doc.file_id, config.telegramBotToken!);
+        } catch (err) {
+          console.error('[Telegram] Failed to download .md file:', err);
+          await ctx.reply('*Error:* Failed to download the \\.md file\\. Please try again\\.', { parse_mode: 'MarkdownV2' });
+          return;
+        }
+      }
+    }
+
     if (!replyText) {
       await ctx.reply(
-        '*Usage:* Send your mission brief as a message, then reply to it with:\n' +
+        '*Usage:* Send your mission brief as a message \\(or upload a \\.md file\\), then reply to it with:\n' +
         '\\`/create title\\="Mission Title" deadline\\=3\\`\n\n' +
         '_deadline is in days \\(default: 7\\)_',
         { parse_mode: 'MarkdownV2' }
@@ -1006,6 +1042,23 @@ export async function startTelegramBot(): Promise<void> {
       'Use /help to see available commands\\.',
       { parse_mode: 'MarkdownV2' }
     );
+  });
+
+  // ============================================================================
+  // .md File Upload — Hint about /create
+  // ============================================================================
+  telegramBot.on('message:document', async (ctx) => {
+    if (!isPrivateChat(ctx)) return;
+
+    const fileName = ctx.message.document.file_name;
+    if (fileName && fileName.endsWith('.md')) {
+      await ctx.reply(
+        '📄 \\.md file detected\\! Reply to this message with:\n' +
+        '\\`/create title\\="Mission Title" deadline\\=3\\`\n\n' +
+        '_to create a mission from it\\._',
+        { parse_mode: 'MarkdownV2' }
+      );
+    }
   });
 
   // ============================================================================
