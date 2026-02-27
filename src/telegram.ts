@@ -915,7 +915,8 @@ export async function startTelegramBot(): Promise<void> {
       await ctx.reply(
         '*Usage:* Send your mission brief as a message \\(or upload a \\.md file\\), then reply to it with:\n' +
         '\\`/create title\\="Mission Title" deadline\\=3\\`\n\n' +
-        '_deadline is in days \\(default: 7\\)_',
+        '_deadline is in days \\(default: 7\\)_\n' +
+        '_Add \\`silent\\=true\\` to skip role pings \\(for testing\\)_',
         { parse_mode: 'MarkdownV2' }
       );
       return;
@@ -935,6 +936,7 @@ export async function startTelegramBot(): Promise<void> {
 
     const title = args.title;
     const deadlineDays = args.deadline ? parseInt(args.deadline, 10) : 7;
+    const silent = args.silent === 'true' || args.silent === 'yes';
     if (isNaN(deadlineDays) || deadlineDays < 1) {
       await ctx.reply('*Error:* Deadline must be a positive number of days\\.', { parse_mode: 'MarkdownV2' });
       return;
@@ -948,7 +950,7 @@ export async function startTelegramBot(): Promise<void> {
     try {
       // Create Discord thread with embed + role pings
       console.log(`[Telegram] /create creating Discord thread: "${title}"`);
-      const threadResult = await createMissionThread(title, replyText, deadlineDays, { roleIds: DEFAULT_MISSION_ROLE_IDS });
+      const threadResult = await createMissionThread(title, replyText, deadlineDays, { roleIds: silent ? [] : DEFAULT_MISSION_ROLE_IDS });
 
       if (!threadResult.success) {
         console.error(`[Telegram] Failed to create Discord thread: ${threadResult.error}`);

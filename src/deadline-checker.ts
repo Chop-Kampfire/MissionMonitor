@@ -7,7 +7,7 @@
 
 import { getMissionsPastDeadline, getSubmissionsByMission, markMissionClosed } from './storage';
 import { exportMissionToSheets, isSheetsConfigured } from './sheets';
-import { closeThread, postMissionSummaryToThread, postMissionResultsToChannel } from './discord';
+import { closeThread, postMissionSummaryToThread, postMissionResultsToChannel, updateStarterEmbed } from './discord';
 
 // Check interval: 5 minutes
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
@@ -44,13 +44,16 @@ async function checkDeadlines(): Promise<void> {
       console.warn(`[DeadlineChecker] Could not close thread for "${mission.title}"`);
     }
 
-    // Step 4: Always mark mission as closed
+    // Step 4: Update the starter embed in the channel (🟢 ACTIVE → 🔴 CLOSED)
+    await updateStarterEmbed(mission);
+
+    // Step 5: Always mark mission as closed
     markMissionClosed(mission.id);
 
-    // Step 5: Post results to results channel
+    // Step 6: Post results to results channel
     await postMissionResultsToChannel(mission, submissions);
 
-    // Step 6: Export to Google Sheets (only if configured)
+    // Step 7: Export to Google Sheets (only if configured)
     if (isSheetsConfigured()) {
       const result = await exportMissionToSheets(mission);
       if (result.success) {

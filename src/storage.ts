@@ -29,6 +29,8 @@ export interface Mission {
   brief?: string; // Optional: full mission brief content
   telegramMessageId?: string; // Message ID of mission announcement in Telegram
   telegramChatId?: string; // Chat ID where mission was announced
+  starterMessageId?: string; // Discord starter message ID (for editing status)
+  channelId?: string; // Discord channel ID where starter message lives
 }
 
 export interface Vote {
@@ -127,7 +129,9 @@ export function registerMission(
   threadId: string,
   title: string,
   deadline: Date,
-  brief?: string
+  brief?: string,
+  starterMessageId?: string,
+  channelId?: string
 ): Mission {
   console.log(`[Storage] DEBUG: registerMission called - threadId=${threadId}, title="${title}"`);
 
@@ -148,6 +152,8 @@ export function registerMission(
     status: 'active',
     createdAt: new Date().toISOString(),
     brief,
+    starterMessageId,
+    channelId,
   };
 
   data.missions.push(mission);

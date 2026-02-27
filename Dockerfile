@@ -11,11 +11,14 @@ COPY tsconfig.json ./
 # Install dependencies
 RUN npm ci
 
-# Copy source code
+# Copy source code and dashboard
 COPY src/ ./src/
+COPY public/ ./public/
 
 # Build TypeScript
 RUN npm run build
+
+EXPOSE 3000
 
 # Run the bot
 CMD ["npm", "start"]

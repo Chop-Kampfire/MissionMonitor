@@ -5,8 +5,9 @@
  */
 
 import { startTelegramBot, stopTelegramBot } from './telegram';
-import { startDiscordBot, stopDiscordBot } from './discord';
+import { startDiscordBot, stopDiscordBot, discordClient } from './discord';
 import { startDeadlineChecker, stopDeadlineChecker } from './deadline-checker';
+import { startStatusServer, stopStatusServer, setDiscordClient, setTelegramRunning } from './status-server';
 
 console.log('='.repeat(50));
 console.log('  Mission Control Bot');
@@ -22,6 +23,7 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`\n[Main] Received ${signal}, shutting down...`);
 
   try {
+    stopStatusServer();
     stopDeadlineChecker();
     stopTelegramBot();
     await stopDiscordBot();
@@ -50,18 +52,24 @@ async function main(): Promise<void> {
   try {
     // Start Discord bot first (quick - just login)
     await startDiscordBot();
+    setDiscordClient(discordClient);
     console.log('[Main] DEBUG: Discord bot started');
 
     // Start Telegram bot (this runs indefinitely via polling)
     // We don't await it because start() never resolves
     startTelegramBot().catch(err => {
       console.error('[Main] Telegram bot error:', err);
+      setTelegramRunning(false);
     });
+    setTelegramRunning(true);
 
     console.log('[Main] DEBUG: Telegram bot starting (long-polling)');
 
     // Start deadline checker (for Google Sheets export)
     startDeadlineChecker();
+
+    // Start status dashboard HTTP server
+    startStatusServer();
 
     console.log('\n[Main] All services initialized!');
     console.log('[Main] Press Ctrl+C to stop.\n');

@@ -428,13 +428,62 @@ export async function createMissionThread(
     await thread.send({ embeds: [embed] });
     console.log(`[Discord] Mission embed posted to thread`);
 
-    // Register the mission in storage
-    registerMission(thread.id, title, deadline, briefContent);
+    // Register the mission in storage (include starter message ID for later editing)
+    registerMission(thread.id, title, deadline, briefContent, starterMessage.id, textChannel.id);
 
     return { success: true, threadId: thread.id };
   } catch (error) {
     console.error('[Discord] Failed to create mission thread:', error);
     return { success: false, error: String(error) };
+  }
+}
+
+/**
+ * Update the starter message embed to reflect mission closure
+ * Changes 🟢 ACTIVE → 🔴 CLOSED and updates the color
+ */
+export async function updateStarterEmbed(mission: import('./storage').Mission): Promise<boolean> {
+  if (!mission.starterMessageId || !mission.channelId) {
+    console.log(`[Discord] No starter message info for "${mission.title}", skipping embed update`);
+    return false;
+  }
+
+  try {
+    const channel = discordClient.channels.cache.get(mission.channelId) as TextChannel
+      ?? await discordClient.channels.fetch(mission.channelId) as TextChannel;
+
+    if (!channel) {
+      console.error(`[Discord] Channel ${mission.channelId} not found for embed update`);
+      return false;
+    }
+
+    const message = await channel.messages.fetch(mission.starterMessageId);
+    if (!message) {
+      console.error(`[Discord] Starter message ${mission.starterMessageId} not found`);
+      return false;
+    }
+
+    // Rebuild the embed with CLOSED status
+    const oldEmbed = message.embeds[0];
+    if (!oldEmbed) {
+      console.error(`[Discord] No embed found on starter message`);
+      return false;
+    }
+
+    const updatedDescription = (oldEmbed.description || '')
+      .replace(/🟢 \*\*ACTIVE\*\*/, '🔴 **CLOSED**');
+
+    const updatedEmbed = EmbedBuilder.from(oldEmbed)
+      .setColor(0xEF4444) // red
+      .setDescription(updatedDescription)
+      .setFooter({ text: 'Mission closed — thread locked' });
+
+    await message.edit({ embeds: [updatedEmbed] });
+    console.log(`[Discord] Starter embed updated to CLOSED for "${mission.title}"`);
+    return true;
+  } catch (error) {
+    console.error(`[Discord] Failed to update starter embed for "${mission.title}":`, error);
+    return false;
   }
 }
 
