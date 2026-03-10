@@ -7,7 +7,7 @@ import * as path from 'path';
 import { Partner, PartnerClip, PartnersData, PartnerSummary, MetricSnapshot } from './types';
 import { fetchTweetMetrics, apiResponseToTweetMetrics, searchTweets } from './twitter';
 
-const DATA_DIR = path.join(__dirname, '..', '..', 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const PARTNERS_FILE = path.join(DATA_DIR, 'partners.json');
 const MAX_FETCH_HISTORY = 30;
 
