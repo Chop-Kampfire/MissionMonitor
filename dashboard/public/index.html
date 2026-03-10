@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tweet Engagement Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Tweet Engagement</h1>
+    <div class="header-actions">
+      <button id="refresh-btn" class="btn">Refresh</button>
+      <div id="status-info" class="meta-text"></div>
+    </div>
+  </header>
+
+  <nav>
+    <button class="nav-btn active" data-view="missions">Missions</button>
+    <button class="nav-btn" data-view="leaderboard">Leaderboard</button>
+    <button class="nav-btn" data-view="partners">Partners</button>
+  </nav>
+
+  <div id="filter-bar" class="filter-bar">
+    <div class="search-wrap">
+      <input type="text" id="search-input" class="input search-input" placeholder="Search...">
+      <span id="search-clear" class="search-clear hidden">&times;</span>
+    </div>
+    <div id="filter-pills" class="filter-pills">
+      <button class="pill active" data-status="all">All</button>
+      <button class="pill" data-status="active">Active</button>
+      <button class="pill" data-status="exported">Exported</button>
+      <button class="pill" data-status="closed">Closed</button>
+    </div>
+    <div id="sort-control" class="sort-control hidden">
+      <label class="sort-label">Sort:</label>
+      <select id="sort-select" class="input sort-select">
+        <option value="engagement-desc">Engagement (high)</option>
+        <option value="engagement-asc">Engagement (low)</option>
+        <option value="impressions-desc">Impressions (high)</option>
+        <option value="impressions-asc">Impressions (low)</option>
+        <option value="rate-desc">Rate (high)</option>
+        <option value="rate-asc">Rate (low)</option>
+        <option value="likes-desc">Likes (high)</option>
+        <option value="retweets-desc">Retweets (high)</option>
+      </select>
+    </div>
+    <div id="result-count" class="result-count"></div>
+  </div>
+
+  <main>
+    <div id="missions-view">
+      <div id="missions-grid" class="card-grid"></div>
+    </div>
+
+    <div id="leaderboard-view" class="hidden">
+      <table id="leaderboard-table" class="data-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Author</th>
+            <th>Mission</th>
+            <th>Impressions</th>
+            <th>Likes</th>
+            <th>RTs</th>
+            <th>Replies</th>
+            <th>Engagement</th>
+            <th>Rate</th>
+            <th>Link</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div id="detail-view" class="hidden">
+      <button id="back-btn" class="btn btn-sm">&larr; Back</button>
+      <h2 id="detail-title"></h2>
+      <div id="detail-stats" class="detail-stats"></div>
+      <table id="detail-table" class="data-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Author</th>
+            <th>Followers</th>
+            <th>Impressions</th>
+            <th>Likes</th>
+            <th>RTs</th>
+            <th>Replies</th>
+            <th>Quotes</th>
+            <th>Bookmarks</th>
+            <th>Rate</th>
+            <th>Link</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- Partners Views -->
+    <div id="partners-view" class="hidden">
+      <div class="section-header">
+        <h2>Partner Tracking</h2>
+        <button id="add-partner-btn" class="btn">+ Add Partner</button>
+      </div>
+      <div id="add-partner-form" class="inline-form hidden">
+        <input type="text" id="partner-name" placeholder="Partner name" class="input">
+        <input type="text" id="partner-handle" placeholder="@handle (optional)" class="input">
+        <button id="save-partner-btn" class="btn btn-primary">Add</button>
+        <button id="cancel-partner-btn" class="btn btn-sm">Cancel</button>
+      </div>
+      <div id="partners-grid" class="card-grid"></div>
+    </div>
+
+    <div id="partner-detail-view" class="hidden">
+      <button id="partner-back-btn" class="btn btn-sm">&larr; Back to Partners</button>
+      <div class="section-header">
+        <h2 id="partner-detail-title"></h2>
+        <button id="delete-partner-btn" class="btn btn-danger btn-sm">Remove Partner</button>
+      </div>
+      <div id="partner-detail-stats" class="detail-stats"></div>
+      <div class="section-header">
+        <h3>Clips</h3>
+        <button id="add-clip-btn" class="btn btn-sm">+ Add Clip</button>
+      </div>
+      <div id="add-clip-form" class="inline-form hidden">
+        <input type="text" id="clip-url" placeholder="Tweet/X URL" class="input input-wide">
+        <input type="text" id="clip-note" placeholder="Note (optional)" class="input">
+        <button id="save-clip-btn" class="btn btn-primary">Add</button>
+        <button id="cancel-clip-btn" class="btn btn-sm">Cancel</button>
+      </div>
+      <table id="partner-clips-table" class="data-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Posted By</th>
+            <th>Followers</th>
+            <th>Views</th>
+            <th>Likes</th>
+            <th>RTs</th>
+            <th>Replies</th>
+            <th>Quotes</th>
+            <th>Bookmarks</th>
+            <th>Rate</th>
+            <th>Note</th>
+            <th>Link</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </main>
+
+  <footer>
+    <p>MissionMonitor Engagement Dashboard &mdash; Auto-refreshes every 60s</p>
+  </footer>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>
