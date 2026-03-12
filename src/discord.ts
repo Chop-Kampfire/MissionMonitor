@@ -21,6 +21,7 @@ import { config } from './config';
 import {
   registerMission,
   getMissionByThread,
+  getActiveMissions,
   createSubmission,
   getSubmissionByMessage,
   getSubmissionsByMission,
@@ -38,6 +39,7 @@ export const discordClient = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
@@ -67,17 +69,30 @@ export const DEFAULT_MISSION_ROLE_IDS = [
 // This is rebuilt on each message, file storage is source of truth
 const messageToSubmissionId = new Map<string, string>();
 
+// Promise that resolves once the bot is ready and startup cleanup is complete
+let resolveCleanupDone: () => void;
+export const cleanupDone = new Promise<void>((resolve) => { resolveCleanupDone = resolve; });
+
 // ============================================================================
 // Event Handlers
 // ============================================================================
 
-discordClient.once(Events.ClientReady, (client) => {
+discordClient.once(Events.ClientReady, async (client) => {
   console.log(`[Discord] Bot ready: ${client.user?.tag}`);
   console.log(`[Discord] Watching guild: ${config.discordGuildId}`);
   console.log(`[Discord] Mission channel: ${config.discordMissionChannelId}`);
   console.log(`[Discord] Results channel: ${config.discordResultsChannelId}`);
   console.log(`[Discord] Judge role IDs: ${config.discordJudgeRoleIds.join(', ')}`);
   console.log(`[Discord] DEBUG: MessageContent intent enabled`);
+
+  // Run one-time cleanup of existing mission threads before deadline checker starts
+  try {
+    await cleanupExistingMissionThreads();
+  } catch (err) {
+    console.error('[Discord] Cleanup failed:', err);
+  }
+
+  resolveCleanupDone();
 });
 
 /**
@@ -189,7 +204,14 @@ discordClient.on(Events.MessageCreate, async (message) => {
       console.error('[Discord] Failed to add reactions:', error);
     }
   } else {
-    console.log(`[Discord] DEBUG: No URLs found in message`);
+    // Delete non-link messages in mission threads to keep them clean
+    console.log(`[Discord] Deleting non-link message from ${message.author.tag} in thread "${thread.name}"`);
+    try {
+      await message.delete();
+      console.log(`[Discord] Non-link message deleted: ${message.id}`);
+    } catch (e) {
+      console.error('[Discord] Failed to delete non-link message:', e);
+    }
   }
 });
 
@@ -217,17 +239,31 @@ discordClient.on(Events.MessageReactionAdd, async (reaction, user) => {
     }
   }
 
+  // Only process reactions in mission threads
+  const channel = reaction.message.channel;
+  if (!channel.isThread()) return;
+  const thread = channel as ThreadChannel;
+  if (thread.parentId !== config.discordMissionChannelId) return;
+
   const emoji = reaction.emoji.name;
   if (!emoji) return;
 
+  const messageId = reaction.message.id;
+
   // Check if this is a vote emoji
   const voteScore = VOTE_EMOJIS[emoji];
+
+  // If it's not a vote emoji, remove it unconditionally (keep threads clean)
   if (voteScore === undefined) {
-    console.log(`[Discord] DEBUG: Not a vote emoji: ${emoji}`);
+    console.log(`[Discord] Removing non-vote reaction "${emoji}" from ${user.tag}`);
+    try {
+      await reaction.users.remove(user.id);
+    } catch (e) {
+      console.error('[Discord] Failed to remove non-vote reaction:', e);
+    }
     return;
   }
 
-  const messageId = reaction.message.id;
   console.log(`[Discord] DEBUG: Vote emoji ${emoji} (score ${voteScore}) on message ${messageId}`);
 
   // Look up submission (check memory first, then file storage)
@@ -235,7 +271,13 @@ discordClient.on(Events.MessageReactionAdd, async (reaction, user) => {
   if (!submissionId) {
     const submission = getSubmissionByMessage(messageId);
     if (!submission) {
-      console.log(`[Discord] DEBUG: Message ${messageId} is not a tracked submission`);
+      // Vote emoji on a non-submission message - remove it
+      console.log(`[Discord] Removing vote reaction on non-submission message ${messageId}`);
+      try {
+        await reaction.users.remove(user.id);
+      } catch (e) {
+        console.error('[Discord] Failed to remove reaction:', e);
+      }
       return;
     }
     submissionId = submission.id;
@@ -705,6 +747,206 @@ export async function postMissionResultsToChannel(
     console.error(`[Discord] Failed to post results to channel:`, error);
     return false;
   }
+}
+
+// ============================================================================
+// One-Time Cleanup
+// ============================================================================
+
+/**
+ * Clean up existing mission threads on startup:
+ * - Remove all non-vote reactions from all messages
+ * - Remove vote reactions from non-submission messages
+ * - Delete messages that don't contain a link (except bot messages)
+ *
+ * This runs once on bot ready to retroactively apply the new rules.
+ */
+/**
+ * Ensure a thread is unarchived and unlocked before performing an action.
+ * If the action fails due to the thread being archived (race with deadline checker),
+ * unarchive/unlock and retry once.
+ */
+async function withThreadUnarchived(thread: ThreadChannel, action: () => Promise<unknown>): Promise<boolean> {
+  try {
+    await action();
+    return true;
+  } catch (e: any) {
+    if (e?.code === 50083) {
+      // Thread was archived (e.g. by deadline checker) - unarchive and retry
+      try {
+        if (thread.locked) await thread.setLocked(false);
+        if (thread.archived) await thread.setArchived(false);
+        await action();
+        return true;
+      } catch (retryErr) {
+        console.error(`[Discord Cleanup] Retry failed:`, retryErr);
+        return false;
+      }
+    }
+    console.error(`[Discord Cleanup] Action failed:`, e);
+    return false;
+  }
+}
+
+async function cleanupExistingMissionThreads(): Promise<void> {
+  const missions = getActiveMissions();
+  if (missions.length === 0) {
+    console.log('[Discord Cleanup] No active missions to clean up');
+    return;
+  }
+
+  console.log(`[Discord Cleanup] Starting cleanup of ${missions.length} active mission thread(s)...`);
+
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  let reactionsRemoved = 0;
+  let messagesDeleted = 0;
+
+  for (const mission of missions) {
+    try {
+      let thread = discordClient.channels.cache.get(mission.threadId) as ThreadChannel | undefined;
+      if (!thread) {
+        try {
+          thread = await discordClient.channels.fetch(mission.threadId) as ThreadChannel | undefined;
+        } catch {
+          console.log(`[Discord Cleanup] Could not fetch thread for "${mission.title}", skipping`);
+          continue;
+        }
+      }
+      if (!thread || !thread.isThread()) {
+        console.log(`[Discord Cleanup] Thread not found for "${mission.title}", skipping`);
+        continue;
+      }
+
+      // Unlock and unarchive temporarily if needed
+      const wasArchived = thread.archived;
+      const wasLocked = thread.locked;
+      if (thread.locked) {
+        await thread.setLocked(false);
+      }
+      if (thread.archived) {
+        await thread.setArchived(false);
+      }
+
+      console.log(`[Discord Cleanup] Cleaning thread "${mission.title}" (${thread.id})...`);
+
+      // Build set of known submission message IDs for this mission
+      const submissions = getSubmissionsByMission(mission.id);
+      const submissionMessageIds = new Set(submissions.map(s => s.messageId));
+
+      // Fetch all messages in the thread (paginated)
+      let lastMessageId: string | undefined;
+      let hasMore = true;
+
+      while (hasMore) {
+        const fetchOptions: { limit: number; before?: string } = { limit: 100 };
+        if (lastMessageId) fetchOptions.before = lastMessageId;
+
+        const messages = await thread.messages.fetch(fetchOptions);
+        if (messages.size === 0) {
+          hasMore = false;
+          break;
+        }
+
+        for (const [, msg] of messages) {
+          // Skip bot messages (embeds, briefings, etc.)
+          if (msg.author.bot) {
+            // Still clean reactions on bot messages
+            for (const [, msgReaction] of msg.reactions.cache) {
+              const emojiName = msgReaction.emoji.name;
+              if (!emojiName) continue;
+
+              // Remove all user reactions from non-submission messages
+              if (!submissionMessageIds.has(msg.id)) {
+                const users = await msgReaction.users.fetch();
+                for (const [userId, reactionUser] of users) {
+                  if (!reactionUser.bot) {
+                    const removed = await withThreadUnarchived(thread!, () => msgReaction.users.remove(userId));
+                    if (removed) reactionsRemoved++;
+                  }
+                }
+              }
+            }
+            continue;
+          }
+
+          // Non-bot message: delete if it doesn't contain a link
+          const hasUrl = urlRegex.test(msg.content);
+          urlRegex.lastIndex = 0; // Reset regex state
+
+          if (!hasUrl) {
+            const deleted = await withThreadUnarchived(thread!, () => msg.delete());
+            if (deleted) messagesDeleted++;
+            continue;
+          }
+
+          // Message has a link - clean up reactions
+          for (const [, msgReaction] of msg.reactions.cache) {
+            const emojiName = msgReaction.emoji.name;
+            if (!emojiName) continue;
+
+            const isVoteEmoji = VOTE_EMOJIS[emojiName] !== undefined;
+            const isSubmission = submissionMessageIds.has(msg.id);
+
+            // Fetch all users who reacted
+            const users = await msgReaction.users.fetch();
+            for (const [userId, reactionUser] of users) {
+              if (reactionUser.bot) continue;
+
+              // Remove non-vote emoji reactions
+              if (!isVoteEmoji) {
+                const removed = await withThreadUnarchived(thread!, () => msgReaction.users.remove(userId));
+                if (removed) reactionsRemoved++;
+                continue;
+              }
+
+              // Remove vote reactions on non-submission messages
+              if (!isSubmission) {
+                const removed = await withThreadUnarchived(thread!, () => msgReaction.users.remove(userId));
+                if (removed) reactionsRemoved++;
+                continue;
+              }
+
+              // Vote emoji on a submission - check judge role
+              let member = thread!.guild.members.cache.get(userId);
+              if (!member) {
+                try {
+                  member = await thread!.guild.members.fetch(userId);
+                } catch {
+                  continue;
+                }
+              }
+
+              const hasJudgeRole = config.discordJudgeRoleIds.some(roleId =>
+                member?.roles.cache.has(roleId)
+              );
+
+              if (!hasJudgeRole) {
+                const removed = await withThreadUnarchived(thread!, () => msgReaction.users.remove(userId));
+                if (removed) reactionsRemoved++;
+              }
+            }
+          }
+        }
+
+        lastMessageId = messages.last()?.id;
+        if (messages.size < 100) hasMore = false;
+      }
+
+      // Restore original archived/locked state
+      if (wasLocked) {
+        await thread.setLocked(true);
+      }
+      if (wasArchived) {
+        await thread.setArchived(true);
+      }
+
+      console.log(`[Discord Cleanup] Finished thread "${mission.title}"`);
+    } catch (error) {
+      console.error(`[Discord Cleanup] Error cleaning thread for "${mission.title}":`, error);
+    }
+  }
+
+  console.log(`[Discord Cleanup] Complete! Removed ${reactionsRemoved} reaction(s), deleted ${messagesDeleted} message(s)`);
 }
 
 // ============================================================================

@@ -5,7 +5,7 @@
  */
 
 import { startTelegramBot, stopTelegramBot } from './telegram';
-import { startDiscordBot, stopDiscordBot, discordClient } from './discord';
+import { startDiscordBot, stopDiscordBot, discordClient, cleanupDone } from './discord';
 import { startDeadlineChecker, stopDeadlineChecker } from './deadline-checker';
 import { startStatusServer, stopStatusServer, setDiscordClient, setTelegramRunning } from './status-server';
 
@@ -64,6 +64,11 @@ async function main(): Promise<void> {
     setTelegramRunning(true);
 
     console.log('[Main] DEBUG: Telegram bot starting (long-polling)');
+
+    // Wait for startup cleanup to finish before starting deadline checker
+    // This prevents the deadline checker from archiving threads mid-cleanup
+    await cleanupDone;
+    console.log('[Main] DEBUG: Startup cleanup complete');
 
     // Start deadline checker (for Google Sheets export)
     startDeadlineChecker();
